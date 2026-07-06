@@ -335,19 +335,8 @@ MIT License - see [LICENSE](LICENSE) file for details.
 ## 🙏 Acknowledgments
 
 - Architecture inspired by the TKG Memory Design Document
-- Built for EFL Internship Application
 - Uses OpenRouter for free LLM access
 - NetworkX for graph operations
-
----
-
-## 📞 Contact
-
-**Author**: [Your Name]  
-**Email**: [your.email@example.com]  
-**LinkedIn**: [Your LinkedIn]  
-**GitHub**: [Your GitHub]
-
 ---
 
 ## 🎯 For Evaluators
