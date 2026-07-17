@@ -37,7 +37,7 @@ class TKGChatCLI:
         print("  [4] Context Engineering       ✓")
         print("  [5] System Prompt Generation  ✓")
         if self.use_llm and self.api_key:
-            print("  [6] LLM Response Generation   ✓ (OpenRouter - Meta Llama 3.1)")
+            print("  [6] LLM Response Generation   ✓ (OpenRouter - gpt-oss-20b)")
         else:
             print("  [6] LLM Response Generation   ⊗ (Simulated - no API key)")
         print("\n" + "=" * 80)
@@ -94,7 +94,7 @@ class TKGChatCLI:
         
         # LAYER 6: LLM Response (or simulation)
         if self.use_llm and self.api_key:
-            print("⚙️  LAYER 6: Generating LLM response (OpenRouter - Meta Llama 3.1)...\n")
+            print("⚙️  LAYER 6: Generating LLM response (OpenRouter - gpt-oss-20b)...\n")
             response = self._call_llm(prompt_result['system_prompt'], user_message)
         else:
             print("⚙️  LAYER 6: Simulating LLM response (no API key provided)...\n")
@@ -124,7 +124,7 @@ class TKGChatCLI:
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "meta-llama/llama-3.1-8b-instruct:free",
+                    "model": "openai/gpt-oss-20b:free",
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_message}
@@ -175,7 +175,7 @@ class TKGChatCLI:
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "meta-llama/llama-3.1-8b-instruct:free",
+                    "model": "openai/gpt-oss-20b:free",
                     "messages": [{"role": "user", "content": "Hi"}],
                     "max_tokens": 10
                 },
@@ -311,6 +311,15 @@ class TKGChatCLI:
 
 def main():
     """Entry point with argument parsing"""
+    # The UI prints emoji/unicode throughout. On consoles whose default
+    # encoding isn't UTF-8 (e.g. Windows cp1252 when output is piped or
+    # redirected) that raises UnicodeEncodeError, so force UTF-8 where possible.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8')
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(
         description="TKG Memory System - CLI with Context Engineering",
         formatter_class=argparse.RawDescriptionHelpFormatter,
