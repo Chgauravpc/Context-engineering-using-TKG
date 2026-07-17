@@ -1,365 +1,270 @@
 # 🧠 TKG Memory System for LLMs
 
-**Temporal Knowledge Graph-based Memory with Automatic Context Engineering**
+**Temporal Knowledge Graph memory with automatic context engineering**
 
-A production-ready implementation of TKG memory for LLMs that automatically generates optimized system prompts from structured, time-aware conversational facts.
+A compact, fully-observable implementation of temporal-knowledge-graph memory for
+LLM conversations. Facts extracted from your messages are stored as a timestamped
+graph, retrieved by concept expansion, and engineered into a grounded system
+prompt — with every layer of the pipeline printed so you can see exactly what the
+model receives.
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> **Scope:** this is a reference implementation and teaching artifact — a full
+> memory pipeline in a few hundred readable lines. It is *not* a production
+> memory service, and it has real, documented limitations (see
+> [Limitations](#-limitations)). For a precise write-up of the design, measured
+> behavior, and honest positioning against existing systems, see
+> **[TECHNICAL_REPORT.md](TECHNICAL_REPORT.md)**.
+
 ---
 
-## 🎯 What Problem Does This Solve?
+## 🎯 What problem does this solve?
 
-Traditional LLMs struggle with:
-- ❌ Losing context in long conversations
-- ❌ Hallucinating facts
-- ❌ No structured memory
-- ❌ Can't reason about changes over time
-- ❌ Conflicting information confuses them
+An LLM is stateless across turns. Without external memory it forgets facts you
+stated moments ago, and — more subtly — it can't tell when a new statement
+**contradicts** an old one. Plain RAG retrieves text chunks but has no notion of
+*when* a fact became true, so "I'm building a REST API" and "let's switch to
+GraphQL" both come back, and the model has to guess.
 
-**This system solves it** by:
-- ✅ Storing facts in a Temporal Knowledge Graph
-- ✅ Automatically resolving conflicts using timestamps
-- ✅ Generating optimized system prompts via Context Engineering
-- ✅ Grounding LLM responses in verified facts
+This system:
+
+- Stores facts in a **temporal knowledge graph** (every edge carries an event time)
+- **Resolves conflicts by relation cardinality** — a newer `WORKING_ON` supersedes
+  the old one, while `USES Redis` and `USES PostgreSQL` correctly coexist
+- Retrieves via **concept expansion** — "what database am I using?" finds
+  PostgreSQL even though the query never says "PostgreSQL"
+- Assembles the surviving facts into a **structured, grounded system prompt**
 
 ---
 
 ## 🏗️ Architecture
 
-Implements the complete **6-layer pipeline**:
+Six layers, executed every turn:
 
 ```
-┌─────────────────────────────┐
-│  [1] Entity Extraction       │  ← Extract entities & relationships
-└──────────────┬──────────────┘
-               │
-┌──────────────▼──────────────┐
-│  [2] TKG Write Layer         │  ← Store with timestamps
-└──────────────┬──────────────┘
-               │
-┌──────────────▼──────────────┐
-│  [3] TKG Retrieval Layer     │  ← Query relevant facts
-└──────────────┬──────────────┘
-               │
-┌──────────────▼──────────────┐
-│  [4] CONTEXT ENGINEERING 🔥  │  ← THE KEY INNOVATION
-│      • Relevance filtering   │
-│      • Conflict resolution   │
-│      • Context compression   │
-│      • Prompt assembly       │
-└──────────────┬──────────────┘
-               │
-┌──────────────▼──────────────┐
-│  [5] System Prompt Gen       │  ← Auto-generated prompts
-└──────────────┬──────────────┘
-               │
-┌──────────────▼──────────────┐
-│  [6] LLM Response            │  ← Grounded answers
-└─────────────────────────────┘
+User message
+   │
+   ▼
+[1] Entity / relation extraction   →  facts {entities, relationships}
+   │
+   ▼
+[2] TKG write                      →  timestamped nodes + edges
+   │
+   ▼
+[3] Retrieval (concept expansion)  →  candidate facts, recency-sorted
+   │
+   ▼
+[4] Context engineering            →  relevance filter → conflict
+   │                                   resolution → compression
+   ▼
+[5] System-prompt assembly         →  structured, sectioned prompt
+   │
+   ▼
+[6] LLM response (optional)        →  grounded answer
 ```
 
-**Key Innovation:** Layer 4 (Context Engineering) automatically transforms raw TKG facts into optimized, conflict-free system prompts.
+Layers 1–3 own the graph (`tkg_core.py`). Layers 4–5 own prompt construction and
+never mutate the graph (`context_engineer.py`). Layer 6 is a thin driver
+(`tkg_cli.py`) that either calls an LLM or produces a deterministic simulated
+answer — so the memory machinery is fully testable with **no API key**.
 
 ---
 
-## 🚀 Quick Start
-
-### Installation (30 seconds)
+## 🚀 Quick start
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/tkg-memory-system.git
-cd tkg-memory-system
-
-# Install dependencies
+git clone https://github.com/Chgauravpc/Context-engineering-using-TKG.git
+cd Context-engineering-using-TKG
 pip install -r requirements.txt
 ```
 
-### Run Demo (Instant)
+**Option 1 — no API key** (the whole pipeline except Layer 6 generation):
 
-**Option 1: Without LLM** (Works immediately, no API key needed)
 ```bash
 python tkg_cli.py
 
-# Try these commands:
-YOU: demo                    # Loads sample conversation
-YOU: What am I working on?   # See context engineering in action
-YOU: stats                   # View graph statistics
+YOU: demo                      # loads the 6-message sample conversation
+YOU: what am I working on      # watch context engineering resolve REST → GraphQL
+YOU: stats                     # graph statistics
 YOU: exit
 ```
 
-**Option 2: With Free LLM** (Better extraction, 2 minutes setup)
+**Option 2 — with a free LLM** (real extraction + generation):
+
 ```bash
-# Get FREE API key from https://openrouter.ai/keys (no credit card!)
+# Free key, no credit card: https://openrouter.ai/keys
 python tkg_cli.py --use-llm --api-key sk-or-v1-YOUR-KEY-HERE
-
-# Same commands as above, but with real LLM extraction and responses
 ```
 
----
-
-## 💡 Key Features
-
-### 1. **Automatic Context Engineering** 
-The system automatically generates system prompts from TKG facts:
-
-**Before (Raw TKG Facts):**
-```
-- user WORKING_ON REST (2025-11-20)
-- user WORKING_ON GraphQL (2025-11-23)
-- user HAS_PREFERENCE Python
-- user HAS_CONSTRAINT Budget_$5000
-... (20 more facts)
-```
-
-**After (Context Engineering):**
-```
-### USER MEMORY CONTEXT
-
-**Current Tasks:**
-- user_demo WORKING_ON GraphQL (as of 2025-11-23)
-  [Note: Supersedes REST decision from 2025-11-20]
-
-**Tech Stack:**
-- Python (preferred)
-
-**Constraints:**
-- Budget: $5000
-
-### INSTRUCTIONS
-- Ground responses in facts above
-- Reference ongoing GraphQL project
-- Maintain temporal consistency
-```
-
-### 2. **Temporal Conflict Resolution**
-- Detects when user changes their mind (REST → GraphQL)
-- Keeps latest decision, notes superseded facts
-- Maintains consistent state
-
-### 3. **Smart Retrieval**
-- Keyword matching with relevance scoring
-- Recency boost (recent facts prioritized)
-- Relationship type prioritization
-- Compresses 100 facts → 8 most relevant
-
-### 4. **Complete Transparency**
-Shows the entire pipeline:
-- Entity extraction results
-- Facts retrieved from TKG
-- Context engineering reasoning
-- **Generated system prompt** ← Key differentiator
-- Final LLM response
-
----
-
-## 📊 Example Output
+**Run the test battery** (16 checks, including failure-mode probes):
 
 ```bash
-YOU: What am I working on?
-
-────────────────────────────────────────────────────────────────────────────
-
-⚙️  LAYER 1 & 2: Extracting entities and updating TKG...
-   → Extracted 2 entities
-   → Extracted 1 relationships
-
-⚙️  LAYER 3: Retrieving relevant facts from TKG...
-   → Retrieved 5 potentially relevant facts
-
-⚙️  LAYER 4 & 5: Context Engineering & System Prompt Generation...
-
-================================================================================
-SYSTEM PROMPT (Generated by Context Engineering Layer)
-================================================================================
-
-### USER MEMORY CONTEXT
-**Current Tasks/Projects:**
-- user_demo WORKING_ON GraphQL_API (as of 2025-11-23T16:30:00)
-
-**Constraints & Requirements:**
-- user_demo HAS_CONSTRAINT Budget_$5000 (as of 2025-11-23T16:28:00)
-
-### TEMPORAL NOTES
-- 2 of these facts were updated in the last 24 hours
-- All facts are timestamped and represent the latest known state
-
-### INSTRUCTIONS
-- Ground your responses in the facts provided above
-- Reference ongoing projects and tasks when relevant
-- Maintain consistency with stored preferences and constraints
-
-────────────────────────────────────────────────────────────────────────────
-CONTEXT ENGINEERING STATS
-────────────────────────────────────────────────────────────────────────────
-Total facts retrieved:  5
-Relevant facts:         5
-Facts in final prompt:  2
-
-Reasoning:
-  • Filtered 5 facts → 5 relevant
-  • Resolved conflicts → 5 consistent facts
-  • Compressed to top 2 facts
-================================================================================
-
-⚙️  LAYER 6: Generating LLM response...
-
-────────────────────────────────────────────────────────────────────────────
-ASSISTANT:
-────────────────────────────────────────────────────────────────────────────
-You're currently working on a GraphQL API with a $5000 budget constraint. 
-Would you like help with GraphQL schema design, resolver implementation, 
-or budget planning for your project?
-────────────────────────────────────────────────────────────────────────────
+python test_battery.py
 ```
 
 ---
 
-## 📁 Project Structure
+## 💡 How it works
+
+### Temporal conflict resolution by relation cardinality
+
+The core rule (`ContextEngineer._resolve_conflicts`) groups facts differently
+depending on whether a relation holds one value or many:
+
+- **Single-valued** (`EXCLUSIVE_RELATIONS = {WORKING_ON}`) — grouped by
+  `(subject, relation)`. A newer target **supersedes** the older one, so
+  *"building a REST API"* → *"switch to GraphQL"* leaves only **GraphQL**.
+- **Multi-valued** (everything else) — grouped by `(subject, relation, object)`.
+  Distinct targets **coexist**, so you keep both **Redis** and **PostgreSQL**.
+
+Edges also carry a monotonic `message_id` used as a **tiebreaker**: on Windows
+`datetime.now()` has ~15 ms resolution, so messages ingested in a tight loop can
+share a timestamp — ordering by time alone would make supersession
+nondeterministic.
+
+### Concept-expansion retrieval
+
+Two dictionaries expand the query before matching:
+
+- `TECH_CATEGORIES` — `database → {PostgreSQL, MySQL, MongoDB, SQLite, Neo4j}`,
+  `caching → {Redis}`, `stack → all`
+- `RELATION_INTENTS` — `requirements → HAS_CONSTRAINT`, `prefer → HAS_PREFERENCE`,
+  `working → WORKING_ON`
+
+This is a hand-built stand-in for semantic search — **not embeddings** — so its
+reach is exactly the size of those dictionaries.
+
+### Full transparency
+
+Every run prints extraction results, retrieved facts, the context-engineering
+reasoning trace, **the generated system prompt**, and the final response.
+
+---
+
+## 📊 Measured behavior
+
+On the built-in 6-message `demo` conversation the graph is **11 nodes / 10 edges**
+(3 `WORKING_ON`, 3 `HAS_CONSTRAINT`, 2 `HAS_PREFERENCE`, 2 `USES`) with no junk
+nodes. Verified by `test_battery.py` (16/16 checks):
+
+| Capability | Query | Result |
+|---|---|---|
+| Concept expansion (DB) | "what database am I using" | **PostgreSQL** |
+| Concept expansion (cache) | "what am I using for caching" | **Redis** |
+| Concept expansion (lang) | "what language do I prefer" | **Python** |
+| Temporal supersession | "what am I working on" | **GraphQL only** (REST/API dropped) |
+| Multi-valued coexistence | "what technologies do I use" | **Redis + PostgreSQL** |
+| Constraint extraction | "what are my constraints" | Budget + Deadline + Performance |
+
+With `--use-llm`, Layer 6 answers are grounded in exactly these retrieved facts —
+it reports GraphQL as the current project (respecting supersession) and
+enumerates the three constraints the context layer selected.
+
+---
+
+## ⚠️ Limitations
+
+These are real and measured, not hypothetical:
+
+| Limitation | Detail |
+|---|---|
+| **Fixed vocabulary** | Pattern extraction only recognizes 19 hard-coded technologies. "Rust with Axum" → **0 edges**. The `--use-llm` path fixes this. |
+| **Negation is not handled** | "I do **not** want MongoDB" is stored as a *positive* fact. **Both** the pattern path and the LLM path get this wrong. |
+| **Mixed intent** | One relation type per message on the pattern path (verb precedence). The LLM path handles this. |
+| **Dictionary retrieval** | Concept expansion covers only the hand-authored maps; it does not generalize. |
+| **No persistence** | In-memory only — the graph is lost on exit. |
+| **Single user** | One hardcoded subject (`user_demo`); no coreference, no multi-party dialogue. |
+| **Ingest-time only** | "the deadline is in December" is stored, but December is never parsed into `event_time`. |
+| **Uniform confidence** | Every edge is `0.9`; the field carries no signal. |
+
+Retrieval also favors **recall over precision**: because `using` maps to the
+`USES` intent, "what *database* am I using" can surface Redis alongside
+PostgreSQL.
+
+---
+
+## 📁 Project structure
 
 ```
-tkg-memory-system/
-├── tkg_core.py              # Layers 1-3: Extraction, Storage, Retrieval
-├── context_engineer.py      # Layers 4-5: Context Engineering & Prompt Gen
-├── tkg_cli.py              # Layer 6: CLI Interface + LLM Integration
-├── requirements.txt        # Python dependencies
-├── README.md              # This file
-└── LICENSE                # MIT License
+├── tkg_core.py            # Layers 1-3: extraction, storage, retrieval
+├── context_engineer.py    # Layers 4-5: context engineering & prompt assembly
+├── tkg_cli.py             # Layer 6: CLI + LLM integration
+├── test_battery.py        # 16 characterization checks incl. failure probes
+├── TECHNICAL_REPORT.md    # Design, evaluation, related work, honest positioning
+├── requirements.txt
+├── LICENSE
+└── Readme.md
 ```
 
 ---
 
-## 🔧 Technical Details
+## 🔧 Technical details
 
-### Storage: NetworkX (In-Memory Graph)
-- **Type:** In-memory directed multi-graph
-- **Retrieval:** Python-based graph traversal (not Cypher)
-- **Scale:** Optimized for demos (<10k nodes)
-- **Production Path:** Migrate to Neo4j with Cypher queries
+**Storage** — NetworkX in-memory `MultiDiGraph`; traversal via the Python API
+(not Cypher). Suitable for demos; a production path would move to Neo4j.
 
-### APIs Used
-- **OpenRouter** (free tier) - Meta Llama 3.1 8B Instruct
-- No OpenAI dependency (fully free!)
+**LLM** — [OpenRouter](https://openrouter.ai) free tier, `openai/gpt-oss-20b`,
+with automatic fallback to pattern extraction on any API error. No OpenAI
+dependency.
 
-### Retrieval Method
-Instead of Cypher queries, uses NetworkX Python API:
-```python
-# Get all edges from user
-for u, v, data in graph.edges(data=True):
-    if u == 'user_demo' and data['type'] == 'WORKING_ON':
-        # Found relevant fact
-```
+> **Note:** the model id is pinned in `tkg_core.py` and `tkg_cli.py`. OpenRouter
+> moves models between free and paid tiers, so if you see
+> `404 – this model is unavailable for free`, swap it for a currently-free model
+> from https://openrouter.ai/models.
 
-### Context Engineering Algorithm
-1. **Filter:** Keyword matching + recency boost
-2. **Resolve:** Group by entity, keep latest timestamp
-3. **Compress:** Score by importance, keep top N
-4. **Assemble:** Structure into categories with instructions
-
----
-
-## 🎓 Use Cases
-
-### 1. **Coding Assistants**
-- Remembers project requirements
-- Tracks tech stack decisions
-- Maintains budget/deadline constraints
-
-### 2. **Research Helpers**
-- Tracks papers discussed
-- Remembers connections between concepts
-- Follows research questions over time
-
-### 3. **Planning Tools**
-- Maintains project timeline
-- Tracks dependencies
-- Notes decision changes
-
----
-
-## 🆚 Comparison with Alternatives
-
-| Approach | This System | RAG | Long Context | Vector DB |
-|----------|-------------|-----|--------------|-----------|
-| **Structure** | ✅ Graph | ❌ Text chunks | ❌ Raw text | ⚠️ Embeddings only |
-| **Temporal Reasoning** | ✅ Yes | ❌ No | ❌ No | ❌ No |
-| **Conflict Resolution** | ✅ Automatic | ❌ Manual | ❌ LLM guesses | ❌ No |
-| **Explainability** | ✅ Full | ⚠️ Partial | ❌ None | ❌ Black box |
-| **Token Efficiency** | ✅ High | ⚠️ Medium | ❌ Low | ✅ High |
-| **Context Quality** | ✅ Structured | ⚠️ Noisy | ⚠️ Overwhelming | ⚠️ Semantic only |
+**Context engineering algorithm**
+1. **Filter** — token overlap + recency boost (with a most-recent fallback if
+   nothing scores)
+2. **Resolve** — group by relation cardinality, keep latest (timestamp, then
+   `message_id`)
+3. **Compress** — score by importance, keep top `max_facts` (default 10)
+4. **Assemble** — structure into sections with grounding instructions
 
 ---
 
 ## 📈 Roadmap
 
-### Current (MVP)
-- ✅ NetworkX in-memory storage
-- ✅ Pattern-based entity extraction
-- ✅ Context engineering with conflict resolution
-- ✅ OpenRouter LLM integration
+**Current**
+- ✅ NetworkX in-memory storage with temporal edges
+- ✅ Pattern-based + optional LLM extraction
+- ✅ Concept-expansion retrieval
+- ✅ Cardinality-aware conflict resolution
+- ✅ Characterization test battery
 
-### Phase 2 (Production)
-- [ ] Migrate to Neo4j for persistent storage
-- [ ] Train custom NER models
-- [ ] Add vector embeddings for hybrid search
-- [ ] Fine-tune Cypher query generator
-- [ ] Multi-user support with RBAC
+**Next — correctness**
+- [ ] **Negation handling** (highest-value fix — currently stores rejections as endorsements)
+- [ ] Parse real-world times into `event_time` (bi-temporal model)
+- [ ] Persistence (JSON snapshot, then Neo4j)
 
-### Phase 3 (Enterprise)
-- [ ] Distributed graph storage
-- [ ] Real-time conflict detection
-- [ ] Advanced temporal queries
-- [ ] Integration with tool ecosystems
+**Later**
+- [ ] Vector embeddings for hybrid retrieval (replace dictionary expansion)
+- [ ] Multi-user support and coreference
+- [ ] Benchmark against LoCoMo / LongMemEval with baselines and ablations
 
 ---
 
 ## 🤝 Contributing
 
-Contributions welcome! Areas for improvement:
-- Better entity extraction patterns
-- More sophisticated conflict resolution rules
-- Additional relationship types
-- Performance optimizations
-- Documentation improvements
+Contributions welcome — the [Limitations](#-limitations) table is the best place
+to start, and negation handling is the highest-impact open issue.
 
 ---
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
 
 ---
 
 ## 🙏 Acknowledgments
 
-- Architecture inspired by the TKG Memory Design Document
-- Uses OpenRouter for free LLM access
-- NetworkX for graph operations
+Built on [NetworkX](https://networkx.org/) for graph operations and
+[OpenRouter](https://openrouter.ai) for free LLM access. The design draws on
+established work in agent memory — MemGPT/Letta, Zep/Graphiti, Mem0, and
+GraphRAG — discussed in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).
+
 ---
 
-## 🎯 For Evaluators
-
-### Key Points:
-1. **Full 6-layer architecture** implemented and working
-2. **Context Engineering (Layer 4)** is the key innovation
-3. **Complete transparency** - shows system prompts generated
-4. **Temporal reasoning** - tracks changes over time
-5. **Production-ready design** - clear path to Neo4j migration
-
-### Demo Commands:
-```bash
-python tkg_cli.py
-YOU: demo
-YOU: What am I working on?
-YOU: stats
-```
-
-### What Makes This Special:
-- Most TKG systems stop at retrieval (Layer 3)
-- This implements **automatic prompt engineering** from graph facts
-- Shows the actual system prompt the LLM receives
-- Resolves conflicts automatically using temporal logic
-
-**Ready for deployment!** 🚀
+**Author:** [@Chgauravpc](https://github.com/Chgauravpc)

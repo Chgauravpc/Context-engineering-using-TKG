@@ -5,6 +5,52 @@ from typing import List, Dict, Any, Optional
 import re
 
 
+# Known technologies, used both to extract clean entities and to answer
+# category questions during retrieval.
+TECH_VOCABULARY = [
+    "Python", "JavaScript", "TypeScript", "React", "Node", "FastAPI", "Flask",
+    "Django", "Neo4j", "GraphQL", "REST", "Redis", "PostgreSQL", "MySQL",
+    "MongoDB", "SQLite", "Docker", "Kubernetes", "API",
+]
+
+# Concept words -> the technologies they refer to. Lets retrieval answer
+# "what database am I using?" without the query literally naming PostgreSQL.
+# Keys are matched against query tokens (both singular and plural forms listed).
+TECH_CATEGORIES = {
+    "database": {"PostgreSQL", "MySQL", "MongoDB", "SQLite", "Neo4j"},
+    "databases": {"PostgreSQL", "MySQL", "MongoDB", "SQLite", "Neo4j"},
+    "db": {"PostgreSQL", "MySQL", "MongoDB", "SQLite", "Neo4j"},
+    "datastore": {"PostgreSQL", "MySQL", "MongoDB", "SQLite", "Neo4j", "Redis"},
+    "cache": {"Redis"},
+    "caching": {"Redis"},
+    "language": {"Python", "JavaScript", "TypeScript"},
+    "languages": {"Python", "JavaScript", "TypeScript"},
+    "framework": {"FastAPI", "Flask", "Django", "React", "Node"},
+    "frameworks": {"FastAPI", "Flask", "Django", "React", "Node"},
+    "stack": set(TECH_VOCABULARY),
+    "tech": set(TECH_VOCABULARY),
+    "technology": set(TECH_VOCABULARY),
+    "technologies": set(TECH_VOCABULARY),
+}
+
+# Query words -> relationship type they ask about. Lets retrieval return all
+# WORKING_ON edges for "what am I working on?" etc.
+RELATION_INTENTS = {
+    "working": "WORKING_ON", "work": "WORKING_ON", "task": "WORKING_ON",
+    "tasks": "WORKING_ON", "project": "WORKING_ON", "projects": "WORKING_ON",
+    "building": "WORKING_ON", "build": "WORKING_ON",
+    "constraint": "HAS_CONSTRAINT", "constraints": "HAS_CONSTRAINT",
+    "requirement": "HAS_CONSTRAINT", "requirements": "HAS_CONSTRAINT",
+    "budget": "HAS_CONSTRAINT", "deadline": "HAS_CONSTRAINT",
+    "limit": "HAS_CONSTRAINT", "limits": "HAS_CONSTRAINT",
+    "preference": "HAS_PREFERENCE", "preferences": "HAS_PREFERENCE",
+    "prefer": "HAS_PREFERENCE", "prefers": "HAS_PREFERENCE",
+    "like": "HAS_PREFERENCE", "likes": "HAS_PREFERENCE",
+    "using": "USES", "uses": "USES", "use": "USES",
+    "need": "USES", "needs": "USES", "dependencies": "USES",
+}
+
+
 class TKGMemory:
     """
     Temporal Knowledge Graph Memory System
@@ -27,63 +73,82 @@ class TKGMemory:
     
     def extract_entities_simple(self, message: str) -> Dict[str, Any]:
         """
-        Simplified entity extraction using pattern matching
-        For demo - in production would use NER + trained models
+        Pattern-based entity/relationship extraction (no LLM).
+
+        Strategy: detect known technologies against a vocabulary and attach
+        them to the relationship the sentence implies (preference / working-on /
+        uses), then pull out budget, deadline and performance constraints. This
+        avoids the noisy trigger-word nodes the naive version produced (e.g.
+        "using", "prefer using", "should").
         """
         entities = []
         relationships = []
-        
-        # Pattern matching for common entities
-        patterns = {
-            'technology': r'\b(Python|JavaScript|React|Node|FastAPI|Neo4j|TKG|GraphQL|REST|API|Redis|PostgreSQL|MongoDB|Docker|Kubernetes)\b',
-            'task': r'\b(build|create|develop|implement|design|deploy|optimize)\s+(\w+)',
-            'constraint': r'\b(budget|deadline|requirement|must|should)\b',
-            'preference': r'\b(prefer|like|want|need)\s+(\w+)',
-        }
-        
-        # Extract entities
-        for entity_type, pattern in patterns.items():
-            matches = re.finditer(pattern, message, re.IGNORECASE)
-            for match in matches:
-                entity_name = match.group(0) if entity_type != 'task' else match.group(2)
-                entities.append({
-                    "name": entity_name.strip(),
-                    "type": entity_type.title(),
-                    "properties": {}
-                })
-        
-        # Extract relationships from patterns
-        if re.search(r'\b(working on|building|creating|developing)\b', message, re.IGNORECASE):
-            tech_matches = re.findall(r'\b(Python|JavaScript|React|GraphQL|REST|API|app|project|system)\b', message, re.IGNORECASE)
-            for tech in tech_matches:
-                relationships.append({
-                    "from": self.user_id,
-                    "to": tech,
-                    "type": "WORKING_ON"
-                })
-        
-        if re.search(r'\b(budget|cost|spend)\b.*?(\$\d+k?|\d+\s*dollars)', message, re.IGNORECASE):
-            budget_match = re.search(r'(\$\d+k?|\d+\s*dollars)', message, re.IGNORECASE)
+        msg_lower = message.lower()
+
+        def add_entity(name, etype):
+            entities.append({"name": name, "type": etype, "properties": {}})
+
+        def add_rel(target, rel_type):
+            relationships.append({
+                "from": self.user_id, "to": target, "type": rel_type
+            })
+
+        # --- Technologies ---------------------------------------------------
+        # Ignore a technology named in an "instead of X" clause: it is being
+        # dropped, so it must not be re-recorded (which would defeat the
+        # temporal supersession, e.g. "switch to GraphQL instead of REST").
+        scan = re.sub(r'\binstead of\s+\w+', '', message, flags=re.IGNORECASE)
+
+        found_tech = []
+        for tech in TECH_VOCABULARY:
+            if re.search(rf'\b{re.escape(tech)}\b', scan, re.IGNORECASE):
+                if tech not in found_tech:
+                    found_tech.append(tech)  # canonical casing
+
+        # Decide the relationship these technologies have with the user, from
+        # the verbs in the sentence. Order matters: preference beats working-on
+        # beats generic use ("I prefer using Python" is a preference).
+        if re.search(r'\b(prefer|prefers|like|likes|favou?rite|favou?rites)\b', msg_lower):
+            tech_rel = "HAS_PREFERENCE"
+        elif re.search(r'\b(working on|build|building|creating|create|developing|develop)\b'
+                       r'|\b(switch(?:ing)?|migrat(?:e|ing)|mov(?:e|ing))\s+to\b', msg_lower):
+            tech_rel = "WORKING_ON"
+        elif re.search(r'\b(need|needs|use|uses|using|require|requires|add|adding|integrate)\b', msg_lower):
+            tech_rel = "USES"
+        else:
+            tech_rel = None
+
+        for tech in found_tech:
+            add_entity(tech, "Technology")
+            if tech_rel:
+                add_rel(tech, tech_rel)
+
+        # --- Budget constraint ---------------------------------------------
+        if re.search(r'\b(budget|cost|spend|price|pricing)\b', msg_lower):
+            budget_match = re.search(r'(\$\s?\d[\d,]*\s?k?|\d[\d,]*\s*dollars)', message, re.IGNORECASE)
             if budget_match:
-                relationships.append({
-                    "from": self.user_id,
-                    "to": f"Budget_{budget_match.group(1)}",
-                    "type": "HAS_CONSTRAINT"
-                })
-        
-        if re.search(r'\b(prefer|like|want)\b', message, re.IGNORECASE):
-            pref_match = re.search(r'(prefer|like|want)\s+(\w+)', message, re.IGNORECASE)
-            if pref_match:
-                relationships.append({
-                    "from": self.user_id,
-                    "to": pref_match.group(2),
-                    "type": "HAS_PREFERENCE"
-                })
-        
-        return {
-            "entities": entities,
-            "relationships": relationships
-        }
+                amount = re.sub(r'\s+', '', budget_match.group(1))
+                name = f"Budget_{amount}"
+                add_entity(name, "Constraint")
+                add_rel(name, "HAS_CONSTRAINT")
+
+        # --- Deadline constraint -------------------------------------------
+        deadline_match = re.search(r'\bdeadline\b\s*(?:is|:)?\s*([\w ]+?)(?:[.,;]|$)', message, re.IGNORECASE)
+        if deadline_match:
+            phrase = deadline_match.group(1).strip()
+            if phrase:
+                name = "Deadline_" + re.sub(r'\s+', '_', phrase)
+                add_entity(name, "Constraint")
+                add_rel(name, "HAS_CONSTRAINT")
+
+        # --- Performance/throughput constraint -----------------------------
+        perf_match = re.search(r'(\d[\d,]*)\s*(requests?|rps|qps|users?|connections?)\b', msg_lower)
+        if perf_match:
+            name = f"Performance_{perf_match.group(1)}_{perf_match.group(2)}"
+            add_entity(name, "Constraint")
+            add_rel(name, "HAS_CONSTRAINT")
+
+        return {"entities": entities, "relationships": relationships}
     
     def extract_entities_llm(self, message: str) -> Dict[str, Any]:
         """
@@ -116,7 +181,8 @@ Rules:
 - Keep entity names simple and clear
 - Return ONLY JSON, no markdown or extra text"""
             
-            # Using OpenRouter with free model (Meta Llama 3.1 8B Instruct)
+            # Using OpenRouter with a currently-free model (OpenAI gpt-oss-20b).
+            # The old llama-3.1-8b:free tier was moved to paid-only upstream.
             response = requests.post(
                 url="https://openrouter.ai/api/v1/chat/completions",
                 headers={
@@ -124,7 +190,7 @@ Rules:
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": "meta-llama/llama-3.1-8b-instruct:free",
+                    "model": "openai/gpt-oss-20b:free",
                     "messages": [
                         {"role": "system", "content": "You extract entities and return only JSON."},
                         {"role": "user", "content": prompt}
@@ -219,41 +285,72 @@ Rules:
         Returns list of facts with temporal info and confidence
         """
         relevant_facts = []
-        
-        # Extract keywords from query
-        keywords = set(re.findall(r'\b\w+\b', query_text.lower()))
-        
+
+        # Extract keywords from query. Split on non-alphanumerics so that
+        # underscores in stored names/relations (e.g. WORKING_ON) tokenize into
+        # separate words and stay matchable.
+        keywords = set(re.findall(r'[a-z0-9]+', query_text.lower()))
+
+        # Concept expansion: turn category words ("database", "cache", "stack")
+        # into the concrete technologies they mean, and intent words ("working",
+        # "requirements", "prefer") into the relationship types they ask about.
+        # This is what lets "what database am I using?" find PostgreSQL even
+        # though the query never says "PostgreSQL".
+        target_techs = set()
+        target_relations = set()
+        for kw in keywords:
+            if kw in TECH_CATEGORIES:
+                target_techs |= TECH_CATEGORIES[kw]
+            if kw in RELATION_INTENTS:
+                target_relations.add(RELATION_INTENTS[kw])
+        target_techs_lower = {t.lower() for t in target_techs}
+
         # Search nodes
         for node_id, node_data in self.graph.nodes(data=True):
             if node_id == self.user_id:
                 continue
-            
-            node_keywords = set(re.findall(r'\b\w+\b', node_id.lower()))
-            if keywords & node_keywords:  # Intersection
+
+            node_keywords = set(re.findall(r'[a-z0-9]+', node_id.lower()))
+            if (keywords & node_keywords) or (node_id.lower() in target_techs_lower):
                 relevant_facts.append({
                     "type": "node",
                     "entity": node_id,
                     "entity_type": node_data.get("type"),
                     "first_mentioned": node_data.get("first_mentioned"),
-                    "last_mentioned": node_data.get("last_mentioned")
+                    "last_mentioned": node_data.get("last_mentioned"),
+                    "message_id": node_data.get("message_id", 0)
                 })
-        
+
         # Search edges/relationships
         for from_node, to_node, edge_data in self.graph.edges(data=True):
-            edge_text = f"{from_node} {edge_data.get('type', '')} {to_node}".lower()
-            if any(kw in edge_text for kw in keywords):
+            rel_type = edge_data.get("type", "")
+            edge_text = f"{from_node} {rel_type} {to_node}".lower()
+            # Match on whole-word tokens (not substrings) so short query words
+            # like "i" don't spuriously match unrelated edges (e.g. "i" inside
+            # "constraint"). Underscores split so WORKING_ON -> {working, on}.
+            edge_keywords = set(re.findall(r'[a-z0-9]+', edge_text))
+            if (keywords & edge_keywords
+                    or rel_type in target_relations
+                    or to_node.lower() in target_techs_lower):
                 relevant_facts.append({
                     "type": "relationship",
                     "from": from_node,
-                    "relation": edge_data.get("type"),
+                    "relation": rel_type,
                     "to": to_node,
                     "event_time": edge_data.get("event_time"),
-                    "confidence": edge_data.get("confidence", 0.9)
+                    "confidence": edge_data.get("confidence", 0.9),
+                    "message_id": edge_data.get("message_id", 0)
                 })
-        
-        # Sort by recency (event_time)
+
+        # Sort by recency (event_time), then message_id as a tiebreaker. The
+        # tiebreaker matters because datetime.now() has coarse resolution on
+        # some platforms (~15ms on Windows), so messages ingested in a tight
+        # loop can share a timestamp; message_id preserves their true order.
+        # Coerce missing/None timestamps to "" so facts without a timestamp
+        # (e.g. auto-created edge-target nodes) don't break the comparison.
         relevant_facts.sort(
-            key=lambda x: x.get("event_time", x.get("last_mentioned", "")),
+            key=lambda x: (x.get("event_time") or x.get("last_mentioned") or "",
+                           x.get("message_id", 0)),
             reverse=True
         )
         

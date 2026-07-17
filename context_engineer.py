@@ -1,3 +1,4 @@
+import re
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -14,6 +15,12 @@ class ContextEngineer:
     4. Prompt assembly - structure facts into coherent system prompt
     """
     
+    # Relations that hold a single current value, so a newer fact *supersedes*
+    # the older one (e.g. the user switches the project's focus from REST to
+    # GraphQL). Every other relation is multi-valued: the user can USE both
+    # Redis and PostgreSQL at once, so those facts must not collapse into one.
+    EXCLUSIVE_RELATIONS = {"WORKING_ON"}
+
     def __init__(self, tkg_memory):
         self.tkg = tkg_memory
         self.max_facts = 10
@@ -66,20 +73,21 @@ class ContextEngineer:
         if not facts:
             return []
         
-        query_keywords = set(query.lower().split())
+        query_keywords = set(re.findall(r'[a-z0-9]+', query.lower()))
         scored_facts = []
-        
+
         for fact in facts:
             score = 0
-            
+
             # Keyword matching
             if fact['type'] == 'relationship':
                 fact_text = f"{fact['from']} {fact['relation']} {fact['to']}".lower()
             else:
                 fact_text = f"{fact['entity']} {fact.get('entity_type', '')}".lower()
-            
-            # Score based on keyword overlap
-            fact_words = set(fact_text.split())
+
+            # Score based on keyword overlap (split on non-alphanumerics so that
+            # underscores in relations/names tokenize into matchable words)
+            fact_words = set(re.findall(r'[a-z0-9]+', fact_text))
             overlap = query_keywords & fact_words
             score += len(overlap) * 2
             
@@ -92,7 +100,7 @@ class ContextEngineer:
                     if age_hours < self.recency_boost_hours:
                         score += 5
                         reasoning.append(f"Boosted recent fact: {fact_text[:50]}")
-                except:
+                except (ValueError, TypeError):
                     pass
             
             # Relationship facts are generally more informative
@@ -104,7 +112,15 @@ class ContextEngineer:
         
         # Sort by score descending
         scored_facts.sort(reverse=True, key=lambda x: x[0])
-        
+
+        # Fallback: if nothing scored above zero (e.g. the query shares no
+        # keywords with any stored fact and all facts are old), don't return an
+        # empty context. Fall back to the facts as retrieved, which query_facts
+        # already sorted by recency.
+        if not scored_facts:
+            reasoning.append("No facts scored on relevance; falling back to most-recent facts")
+            return facts
+
         return [fact for score, fact in scored_facts]
     
     def _resolve_conflicts(self, facts: List[Dict], reasoning: List[str]) -> List[Dict]:
@@ -117,8 +133,14 @@ class ContextEngineer:
         
         for fact in facts:
             if fact['type'] == 'relationship':
-                # Group by (from, relation) - allows tracking changes
-                key = (fact['from'], fact['relation'])
+                if fact['relation'] in self.EXCLUSIVE_RELATIONS:
+                    # Single-valued: group by (from, relation) so a newer target
+                    # supersedes the older one (REST -> GraphQL).
+                    key = (fact['from'], fact['relation'])
+                else:
+                    # Multi-valued: group by (from, relation, to) so distinct
+                    # targets coexist and only exact duplicates are deduped.
+                    key = (fact['from'], fact['relation'], fact['to'])
                 fact_groups[key].append(fact)
             else:
                 # Group by entity name
@@ -132,9 +154,13 @@ class ContextEngineer:
                 resolved.append(group[0])
             else:
                 # Multiple facts for same entity/relationship - pick latest
+                # Sort by timestamp, then message_id as a tiebreaker so the more
+                # recently stated fact wins even when timestamps collide (coarse
+                # clock resolution can give same-loop messages equal timestamps).
                 sorted_group = sorted(
-                    group, 
-                    key=lambda f: f.get('event_time', f.get('last_mentioned', '')),
+                    group,
+                    key=lambda f: (f.get('event_time') or f.get('last_mentioned') or '',
+                                   f.get('message_id', 0)),
                     reverse=True
                 )
                 
@@ -175,7 +201,7 @@ class ContextEngineer:
                     hours_old = (datetime.now() - fact_time).total_seconds() / 3600
                     # Decay score over time
                     score += max(0, 10 - (hours_old / 24))
-                except:
+                except (ValueError, TypeError):
                     pass
             
             # Certain relationship types are more important
@@ -286,7 +312,7 @@ class ContextEngineer:
         try:
             fact_time = datetime.fromisoformat(event_time)
             return (datetime.now() - fact_time) < timedelta(hours=hours)
-        except:
+        except (ValueError, TypeError):
             return False
     
     def generate_user_prompt(self, user_message: str, system_prompt_result: Dict) -> str:
